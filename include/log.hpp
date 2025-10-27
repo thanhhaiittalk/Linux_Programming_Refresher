@@ -1,11 +1,12 @@
 #pragma once
 #include <string>
+#include <mutex>
 
 // Runtime options
 struct Options {
     bool foreground = true;
-    std::string log_path = "/tmp/videolog.txt";
-    int sync_every = 5;
+    std::string log_path = "./log.txt";
+    int sync_every = 1;
 };
 
 // --- CLI as a class ---
@@ -28,11 +29,33 @@ Options parse_cli(int argc, char** argv);
 // --- App skeleton (unchanged) ---
 class App {
 public:
-    explicit App(const Options& opt);
+        // Get or create singleton instance
+    static App& instance(const Options& opt);
+    static App& instance();
+
+    
     int run();
 
 private:
+    explicit App(const Options& opt);
+    ~App() = default;
+
+    // Disable copy / assignment
+    App(const App&) = delete;
+    App& operator=(const App&) = delete;
+
     Options opt_;
+    std::mutex logMutex_;
+    int fd_ = -1;
+
     void run_foreground();
     void run_daemon();
+    void log();
+
+    void safe_write_all(int fd, const std::string &line) ;
+    std::string timestamp_now();
+    void thread_heartbeat();
+    void thread_loadavg();
+    void thread_sync();
+    bool read_loadavg(double &one, double &five, double &fifteen);
 };

@@ -13,8 +13,8 @@ int main(int argc, char** argv) {
     const Options& opt = cli.options();
 
     // Create the main application object
-    App app(opt);
-
+    App& app = App::instance(opt); // first call → creates singleton
+    
     // Run the app (decides foreground or daemon)
     return app.run();
 }
