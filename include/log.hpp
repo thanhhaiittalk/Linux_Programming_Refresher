@@ -1,6 +1,8 @@
 #pragma once
 #include <string>
 #include <mutex>
+#include <thread>
+#include <atomic>
 
 // Runtime options
 struct Options {
@@ -48,6 +50,15 @@ private:
     std::mutex logMutex_;
     int fd_ = -1;
 
+    static std::atomic<bool> stop_requested_;
+    static std::atomic<bool> rotate_requested_;
+    static std::atomic<bool> sigint_logged_;
+
+    // Thread
+    std::thread tHB_;
+    std::thread tSYS_;
+    std::thread tSYNC_;
+
     void run_foreground();
     void run_daemon();
     void log();
@@ -58,4 +69,14 @@ private:
     void thread_loadavg();
     void thread_sync();
     bool read_loadavg(double &one, double &five, double &fifteen);
+    void open_logfile();
+
+    // Signal Helper
+    void install_signal_handlers();
+    static void signal_trampoline(int sig); // static -> calls into singleton
+    void handle_sigint();  // set stop flag + log ctrl line
+    void handle_sighup();  // set rotate flag
+
+    void rotate_logfile_locked(); // does real rotation under mutex
+    void graceful_shutdown();     // join threads, fsync, close fd
 };
