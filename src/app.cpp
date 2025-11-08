@@ -81,11 +81,6 @@ void App::run_daemon() {
         std::exit(0);
     }
 
-    umask(027);
-    if (chdir("/") != 0) {
-        std::perror("chdir");
-    }
-
     std::cout << "[daemon] running, pid=" << getpid() << "\n";
     std::cout << "Log path: " << opt_.log_path
               << ", sync every: " << opt_.sync_every << "s\n";
