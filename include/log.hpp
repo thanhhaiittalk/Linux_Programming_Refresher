@@ -62,7 +62,7 @@ private:
     // --- Control interface ---
     std::thread tCTRL_;                    // control thread
     int ctrl_srv_fd_ = -1;                 // listening socket fd
-    std::string ctrl_sock_path_ = "/tmp/videologd.sock";  // socket file path
+    std::string ctrl_sock_path_ = "/tmp/logd.sock";  // socket file path
     std::atomic<bool> ctrl_stop_{false};   // stop flag for control thread
     
     void run_foreground();
@@ -87,12 +87,10 @@ private:
     void graceful_shutdown();     // join threads, fsync, close fd
 
     // Start/stop the UNIX control socket server
-    bool start_control_interface(const std::string& sock_path = "/tmp/videologd.sock");
+    bool start_control_interface(const std::string& sock_path = "/tmp/logd.sock");
     void stop_control_interface();
-    
+
     // Thread function and command handler
     void control_thread_fn();
     void handle_control_command(const std::string& cmd, int client_fd);
-
-    
 };

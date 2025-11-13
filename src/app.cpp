@@ -13,7 +13,11 @@
 #include <thread>
 #include <cstring>
 #include <atomic>
-#include <csignal> 
+#include <csignal>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <vector>
+#include <poll.h> 
 // ------------ static atomics ------------
 std::atomic<bool> App::stop_requested_{false};
 std::atomic<bool> App::rotate_requested_{false};
@@ -104,6 +108,12 @@ void App::log() {
     }
     // install SIGINT / SIGHUP handlers
     install_signal_handlers();
+
+    // Start control interface (create socket, spawn tCTRL_)
+    if (!start_control_interface("/tmp/logd.sock")) {
+        std::cerr << "warning: control interface failed to start\n";
+        // continue anyway — the daemon can run without control socket
+    }
 
     std::thread tHB_(&App::thread_heartbeat, this);
     std::thread tSYS_(&App::thread_loadavg,   this);
@@ -304,6 +314,8 @@ void App::rotate_logfile_locked(){
 
 } // does real rotation under mutex
 void App::graceful_shutdown(){
+    // stop control interface first so control thread unblocks and exits
+    stop_control_interface();
     // tell worker threads to exit (they read stop_requested_)
     // join them
     if (tHB_.joinable())   tHB_.join();
@@ -330,3 +342,299 @@ void App::graceful_shutdown(){
     // exit(0) here is optional; caller can also just return
     std::_Exit(0);
 }     // join threads, fsync, close fd
+
+/*UNIX Domain socket*/
+// correct — no default in definition
+bool App::start_control_interface(const std::string& sock_path) {
+    // If control thread already running, don't start again.
+    if (tCTRL_.joinable() || ctrl_srv_fd_ >= 0) {
+        return false;
+    }
+
+    // save the socket path
+    ctrl_sock_path_ = sock_path;
+
+    // remove stale socket file if present
+    ::unlink(ctrl_sock_path_.c_str());
+
+    // create unix domain stream socket
+    ctrl_srv_fd_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (ctrl_srv_fd_ < 0) {
+        perror("control socket");
+        ctrl_srv_fd_ = -1;
+        return false;
+    }
+
+    // set CLOEXEC so child/exec'd processes won't inherit the FD
+    int fdflags = fcntl(ctrl_srv_fd_, F_GETFD, 0);
+    if (fdflags != -1) {
+        fcntl(ctrl_srv_fd_, F_SETFD, fdflags | FD_CLOEXEC);
+    }
+
+        // prepare address
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    if (ctrl_sock_path_.size() >= sizeof(addr.sun_path)) {
+        std::cerr << "control socket path too long: " << ctrl_sock_path_ << "\n";
+        ::close(ctrl_srv_fd_);
+        ctrl_srv_fd_ = -1;
+        return false;
+    }
+    std::strncpy(addr.sun_path, ctrl_sock_path_.c_str(), sizeof(addr.sun_path) - 1);
+
+    // bind
+    if (::bind(ctrl_srv_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        perror("bind control socket");
+        ::close(ctrl_srv_fd_);
+        ctrl_srv_fd_ = -1;
+        // ensure no stale file left
+        ::unlink(ctrl_sock_path_.c_str());
+        return false;
+    }
+
+    // set socket file permissions: owner read/write (adjust if you want group access)
+    ::chmod(ctrl_sock_path_.c_str(), S_IRUSR | S_IWUSR);
+
+    // listen
+    if (::listen(ctrl_srv_fd_, 5) < 0) {
+        perror("listen control socket");
+        ::close(ctrl_srv_fd_);
+        ctrl_srv_fd_ = -1;
+        ::unlink(ctrl_sock_path_.c_str());
+        return false;
+    }
+
+        // clear stop flag and ignore SIGPIPE to avoid termination on broken pipes
+    ctrl_stop_.store(false, std::memory_order_relaxed);
+    ::signal(SIGPIPE, SIG_IGN);
+
+     // spawn control thread that runs control_thread_fn()
+    try {
+        tCTRL_ = std::thread(&App::control_thread_fn, this);
+    } catch (...) {
+        // thread creation failed: cleanup
+        ::close(ctrl_srv_fd_);
+        ctrl_srv_fd_ = -1;
+        ::unlink(ctrl_sock_path_.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+void App::stop_control_interface() {
+        // Step 1: signal control thread to stop
+    ctrl_stop_.store(true, std::memory_order_relaxed);
+
+    // Step 2: close listening socket if open
+    if (ctrl_srv_fd_ >= 0) {
+        // shutdown wakes up accept() or poll() inside control_thread_fn
+        ::shutdown(ctrl_srv_fd_, SHUT_RDWR);
+        ::close(ctrl_srv_fd_);
+        ctrl_srv_fd_ = -1;
+    }
+
+    // Step 3: wait for control thread to finish
+    if (tCTRL_.joinable()) {
+        tCTRL_.join();
+    }
+
+    // Step 4: remove the socket file
+    if (!ctrl_sock_path_.empty()) {
+        ::unlink(ctrl_sock_path_.c_str());
+    }
+}
+
+void App::control_thread_fn() {
+    if (ctrl_srv_fd_ < 0) return;
+
+    constexpr int POLL_TIMEOUT_MS = 500;
+    constexpr size_t BUF_SZ = 4096;
+
+    // Ensure SIGPIPE won't kill the thread (safe-guard)
+    ::signal(SIGPIPE, SIG_IGN);
+
+    while (!ctrl_stop_.load(std::memory_order_relaxed)) {
+        struct pollfd pfd{};
+        pfd.fd = ctrl_srv_fd_;
+        pfd.events = POLLIN;
+
+        int ret = ::poll(&pfd, 1, POLL_TIMEOUT_MS);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            // serious poll error: abort loop
+            perror("poll(control)");
+            break;
+        } else if (ret == 0) {
+            // timeout - check stop flag again
+            continue;
+        }
+
+
+        if (pfd.revents & (POLLERR | POLLNVAL)) {
+            // fatal on listen fd
+            perror("poll error or invalid");
+            break;
+        }
+
+        if (pfd.revents & POLLIN) {
+            while (true){
+                int cfd = ::accept(ctrl_srv_fd_, nullptr, nullptr);
+                if (cfd < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        // no more pending connections
+                        break;
+                    }
+                    if (errno == EINTR) {
+                        // try again
+                        continue;
+                    }
+                    // real error on accept — log and break accept loop
+                    perror("accept(control)");
+                    break;
+                }
+
+                // Set close-on-exec on client fd
+                int fdflags = fcntl(cfd, F_GETFD, 0);
+                if (fdflags != -1) {
+                    fcntl(cfd, F_SETFD, fdflags | FD_CLOEXEC);
+                }
+
+                // Read up to BUF_SZ from client. We take the first line as the command.
+                std::string cmdline;
+                {
+                    char buf[BUF_SZ];
+                    ssize_t n = ::recv(cfd, buf, sizeof(buf), 0);
+                    if (n > 0) {
+                        cmdline.assign(buf, buf + n);
+                        // extract only the first line if multiple lines in buffer
+                        auto pos = cmdline.find('\n');
+                        if (pos != std::string::npos) {
+                            cmdline.erase(pos); // drop trailing data after first newline
+                        }
+                        // strip trailing CR if present
+                        if (!cmdline.empty() && cmdline.back() == '\r') cmdline.pop_back();
+                    } else if (n == 0) {
+                        // client closed immediately, nothing to do
+                        ::close(cfd);
+                        continue;
+                    } else {
+                        // recv error
+                        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                            // treat as no data
+                            ::close(cfd);
+                            continue;
+                        } else {
+                            // other error
+                            perror("recv(control)");
+                            ::close(cfd);
+                            continue;
+                        }
+                    }
+                }
+
+                // handle the command (inside this thread)
+                handle_control_command(cmdline, cfd);
+
+                // Close client connection (handler already wrote reply)
+                ::shutdown(cfd, SHUT_RDWR);
+                ::close(cfd);
+
+
+                // If ctrl_stop_ became true while handling command, break out early
+                if (ctrl_stop_.load(std::memory_order_relaxed)) break;
+            } 
+        }
+    }// end main loop
+    
+    if (ctrl_srv_fd_ >= 0) {
+        ::close(ctrl_srv_fd_);
+        ctrl_srv_fd_ = -1;
+    }
+
+    if (!ctrl_sock_path_.empty()) {
+        ::unlink(ctrl_sock_path_.c_str());
+    }
+}
+
+void App::handle_control_command(const std::string& cmd, int client_fd) {
+    // Trim whitespace (leading/trailing)
+    auto trim = [](const std::string &s) -> std::string {
+        size_t a = 0;
+        while (a < s.size() && isspace((unsigned char)s[a])) ++a;
+        size_t b = s.size();
+        while (b > a && isspace((unsigned char)s[b-1])) --b;
+        return s.substr(a, b - a);
+    };
+
+    std::string line = trim(cmd);
+    std::string reply;
+
+        // Tokenize input
+    std::istringstream iss(line);
+    std::vector<std::string> parts;
+    std::string tok;
+    while (iss >> tok) parts.push_back(tok);
+
+    if (line.empty()) {
+       reply = "ERR empty command\n";
+    } else if (parts[0] == "status") {
+        // handle status
+        int sync_val;
+        {
+            std::lock_guard<std::mutex> lk(logMutex_);
+            sync_val = opt_.sync_every;
+        }
+        std::ostringstream oss;
+        oss << "OK status: running sync_every=" << sync_val << "\n";
+        reply = oss.str();
+    }
+    else if (parts[0] == "rotate") {
+        // rotate logs
+        {
+            std::lock_guard<std::mutex> lk(logMutex_);
+            rotate_logfile_locked();
+        }
+        reply = "OK rotate\n";
+    }
+    else if (parts[0] == "shutdown") {
+        stop_requested_.store(true, std::memory_order_relaxed);
+        sigint_logged_.store(true, std::memory_order_relaxed);
+        reply = "OK shutdown\n";
+    }
+    else if (parts[0] == "sync_every"){
+        if (parts.size() != 2) {
+            reply = "ERR usage: sync_every <seconds>\n";
+        } else {
+            try {
+                int n = std::stoi(parts[1]);
+                if (n <= 0) {
+                    reply = "ERR invalid number\n";
+                } else {
+                    {
+                        std::lock_guard<std::mutex> lk(logMutex_);
+                        opt_.sync_every = n;
+                    }
+                    reply = "OK sync_every " + std::to_string(n) + "\n";
+                }
+            } catch (...) {
+                reply = "ERR invalid number\n";
+            }
+        }
+    } 
+    else {
+        reply = "ERR unknown\n";
+    }
+
+    // send reply (best-effort)
+    const char* buf = reply.data();
+    size_t to_send = reply.size();
+    size_t sent = 0;
+
+    while (sent < to_send) {
+        ssize_t n = ::send(client_fd, buf + sent, to_send - sent, 0);
+        if (n > 0) { sent += static_cast<size_t>(n); continue; }
+        if (n < 0 && errno == EINTR) continue;
+        break; // EPIPE or error
+    }
+}
