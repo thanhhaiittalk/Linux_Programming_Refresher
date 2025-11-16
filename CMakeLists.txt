@@ -13,5 +13,12 @@ add_executable(log
     src/app.cpp
 )
 
+# -----------------------
+# Build the CLI tool
+# -----------------------
+add_executable(logctl
+    CLI_app/logctl.cpp
+)
+
 # Include directory
 target_include_directories(log PRIVATE include)

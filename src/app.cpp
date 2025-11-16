@@ -211,7 +211,6 @@ void App::thread_loadavg() {
 void App::thread_sync() {
     while (true) {
         std::this_thread::sleep_for(std::chrono::seconds(opt_.sync_every));
-
         {
             // protect fsync too, so we don't sync while another thread is mid-write
             std::lock_guard<std::mutex> lock(logMutex_);
@@ -220,9 +219,16 @@ void App::thread_sync() {
                 rotate_logfile_locked(); // does its own fsync/close/reopen and writes "[CTRL] log rotated"
             } else {
                 if (fd_ >= 0) {
-                    ::fsync(fd_);
-                    // you could also write a debug sync line if you like
-                    // e.g. "[SYNC] flushed"
+                     std::ostringstream oss;
+                     oss << timestamp_now()
+                         << " SYNCED" 
+                         << "\n";
+                     {
+                         safe_write_all(fd_, oss.str());
+                     }
+                     ::fsync(fd_);
+                     // you could also write a debug sync line if you like
+                     // e.g. "[SYNC] flushed"
                 }
             }
         }
