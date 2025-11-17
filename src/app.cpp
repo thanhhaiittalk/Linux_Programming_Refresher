@@ -1,6 +1,9 @@
 // src/app.cpp
 #include "log.hpp"
+#include "shared_stats.hpp"
 
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <iostream>
 #include <fstream> 
 #include <cstdio>
@@ -106,6 +109,10 @@ void App::log() {
                   << " err=" << std::strerror(errno) << "\n";
         return;
     }
+
+    if (!shared_init_writer()) {
+        std::cerr << "warning: shared memory init failed, continuing without shm\n";
+    }
     // install SIGINT / SIGHUP handlers
     install_signal_handlers();
 
@@ -177,6 +184,17 @@ void App::thread_heartbeat() {
         {
             std::lock_guard<std::mutex> lock(logMutex_);
             safe_write_all(fd_, oss.str());
+        }
+
+        if (shm_ptr_) {
+            // lock the shared mutex (best-effort robust handling omitted)
+            if (pthread_mutex_lock(&shm_ptr_->lock) == 0) {
+                shm_ptr_->value = static_cast<uint64_t>(tick); // dummy payload
+                shm_ptr_->writer = static_cast<pid_t>(::getpid());
+                pthread_mutex_unlock(&shm_ptr_->lock);
+            } else {
+                // optionally log or ignore if lock failed
+            }
         }
 
         std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -322,6 +340,10 @@ void App::rotate_logfile_locked(){
 void App::graceful_shutdown(){
     // stop control interface first so control thread unblocks and exits
     stop_control_interface();
+
+    // Unmap shared memory
+    shared_unmap_writer();
+
     // tell worker threads to exit (they read stop_requested_)
     // join them
     if (tHB_.joinable())   tHB_.join();
@@ -643,4 +665,97 @@ void App::handle_control_command(const std::string& cmd, int client_fd) {
         if (n < 0 && errno == EINTR) continue;
         break; // EPIPE or error
     }
+}
+
+/*Shared memory*/
+bool App::shared_init_writer() {
+    // If already initialized, nothing to do
+    if (shm_ptr_ != nullptr || shm_fd_ >= 0) return true;
+
+    // Open/create shared memory
+    shm_fd_ = ::shm_open(SHM_STATS_NAME, O_CREAT | O_RDWR, 0644);
+    if (shm_fd_ < 0) {
+        std::cerr << "shm_open failed: " << std::strerror(errno) << "\n";
+        shm_fd_ = -1;
+        return false;
+    }
+
+    // Ensure size
+    if (::ftruncate(shm_fd_, static_cast<off_t>(sizeof(SharedStats))) < 0) {
+        std::cerr << "ftruncate(shm) failed: " << std::strerror(errno) << "\n";
+        ::close(shm_fd_);
+        shm_fd_ = -1;
+        ::shm_unlink(SHM_STATS_NAME); // try to clean up
+        return false;
+    }
+
+    // mmap it
+    void* p = ::mmap(nullptr, sizeof(SharedStats),
+                     PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd_, 0);
+    if (p == MAP_FAILED) {
+        std::cerr << "mmap(shm) failed: " << std::strerror(errno) << "\n";
+        ::close(shm_fd_);
+        shm_fd_ = -1;
+        ::shm_unlink(SHM_STATS_NAME);
+        return false;
+    }
+
+    shm_ptr_ = reinterpret_cast<SharedStats*>(p);
+
+    // Zero memory first (important before initializing a pthread mutex in-shm)
+    std::memset(shm_ptr_, 0, sizeof(SharedStats));
+
+    // Initialize mutex attr for process-shared mutex
+    pthread_mutexattr_t mattr;
+    if (pthread_mutexattr_init(&mattr) != 0) {
+        std::cerr << "pthread_mutexattr_init failed\n";
+        // cleanup
+        shared_unmap_writer();
+        return false;
+    }
+
+    if (pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED) != 0) {
+        std::cerr << "pthread_mutexattr_setpshared failed\n";
+        pthread_mutexattr_destroy(&mattr);
+        shared_unmap_writer();
+        return false;
+    }
+
+    // Optionally make robust to handle owner death
+    // pthread_mutexattr_setrobust(&mattr, PTHREAD_MUTEX_ROBUST);
+
+    if (pthread_mutex_init(&shm_ptr_->lock, &mattr) != 0) {
+        std::cerr << "pthread_mutex_init failed\n";
+        pthread_mutexattr_destroy(&mattr);
+        shared_unmap_writer();
+        return false;
+    }
+
+    pthread_mutexattr_destroy(&mattr);
+
+    // Initialize data fields
+    shm_ptr_->value = 0;
+    shm_ptr_->writer = 0;
+
+    // keep the FD open (allows other processes to open it too)
+    return true;
+}
+
+void App::shared_unmap_writer() {
+    if (shm_ptr_) {
+        // Best-effort: destroy mutex (only if no other processes using it)
+        // Note: destroying a process-shared mutex while other processes exist is UB.
+        // We attempt to destroy but ignore errors.
+        pthread_mutex_destroy(&shm_ptr_->lock);
+
+        ::munmap(reinterpret_cast<void*>(shm_ptr_), sizeof(SharedStats));
+        shm_ptr_ = nullptr;
+    }
+    if (shm_fd_ >= 0) {
+        ::close(shm_fd_);
+        shm_fd_ = -1;
+    }
+    // Unlink the name so it doesn't linger in /dev/shm after clean shutdown.
+    // If you prefer not to unlink (for debugging), remove this call.
+    ::shm_unlink(SHM_STATS_NAME);
 }

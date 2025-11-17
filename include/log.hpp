@@ -3,7 +3,7 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
-
+#include "shared_stats.hpp"
 // Runtime options
 struct Options {
     bool foreground = true;
@@ -54,6 +54,10 @@ private:
     static std::atomic<bool> rotate_requested_;
     static std::atomic<bool> sigint_logged_;
 
+    // Shared memory
+    int shm_fd_ = -1;
+    SharedStats* shm_ptr_ = nullptr;
+
     // Thread
     std::thread tHB_;
     std::thread tSYS_;
@@ -93,4 +97,8 @@ private:
     // Thread function and command handler
     void control_thread_fn();
     void handle_control_command(const std::string& cmd, int client_fd);
+
+    // Shared memory
+    bool shared_init_writer();    // create / map and initialize shared memory (called at startup)
+    void shared_unmap_writer();   // munmap/close/unlink (called on shutdown)
 };
