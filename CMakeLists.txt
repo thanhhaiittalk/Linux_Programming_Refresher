@@ -20,5 +20,12 @@ add_executable(logctl
     CLI_app/logctl.cpp
 )
 
+# -----------------------
+# Build the Shared memory tool
+# -----------------------
+add_executable(shm_log
+    Shm_app/shm_log.cpp
+)
 # Include directory
 target_include_directories(log PRIVATE include)
+target_include_directories(shm_log PRIVATE include)
